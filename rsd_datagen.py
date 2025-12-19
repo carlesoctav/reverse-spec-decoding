@@ -84,9 +84,9 @@ class HFSource:
     path: str
     name: Optional[str] = None
     split: str = "train"
-    num_proc: int = 8
     prompt_column: str = "question"
     response_column: str = "answer"
+    is_messages: bool = False  # If True, prompt_column contains a list of messages
 
     def load_args(self) -> dict:
         """Get arguments for load_dataset."""
@@ -118,12 +118,47 @@ class DatasetConfig:
         """Load and concatenate all dataset sources."""
         datasets = []
         for source in self.sources:
-            ds = load_dataset(**source.load_args())
-            # Rename columns to standard names
-            if source.prompt_column != "prompt":
-                ds = ds.rename_column(source.prompt_column, "prompt")
-            if source.response_column != "response":
-                ds = ds.rename_column(source.response_column, "response")
+            ds = load_dataset(**source.load_args(), streaming=True)
+
+            # Handle messages format: extract first message content as prompt
+            if source.is_messages:
+                prompt_col = source.prompt_column
+
+                def extract_messages(example):
+                    messages = example[prompt_col]
+                    if messages and len(messages) > 0:
+                        # Take the first message's content as prompt (usually user)
+                        first_msg = messages[0]
+                        if isinstance(first_msg, dict):
+                            example["prompt"] = first_msg.get("content", "")
+                        else:
+                            example["prompt"] = str(first_msg)
+
+                        # Take the second message's content as response (usually assistant)
+                        if len(messages) > 1:
+                            second_msg = messages[1]
+                            if isinstance(second_msg, dict):
+                                example["response"] = second_msg.get("content", "")
+                            else:
+                                example["response"] = str(second_msg)
+                        else:
+                            example["response"] = ""
+                    else:
+                        example["prompt"] = ""
+                        example["response"] = ""
+                    return example
+
+                ds = ds.map(extract_messages)
+                # Remove original messages column if different from "prompt"
+                if source.prompt_column != "prompt":
+                    ds = ds.remove_columns([source.prompt_column])
+            else:
+                # Rename columns to standard names
+                if source.prompt_column != "prompt":
+                    ds = ds.rename_column(source.prompt_column, "prompt")
+
+                if source.response_column != "response":
+                    ds = ds.rename_column(source.response_column, "response")
             datasets.append(ds)
 
         if len(datasets) == 1:
@@ -173,6 +208,7 @@ class RSDConfig:
     threshold: float = 0.1  # P_s(y) threshold for acceptance (10%)
     max_tokens: int = 2048  # Maximum tokens per generation
     lookahead: int = 8  # Speculative lookahead batch size
+    concurrency: int = 4  # Number of examples to process concurrently
 
     # Output
     output: str = "rsd_traces.jsonl"
@@ -433,12 +469,21 @@ async def rsd_decode(
     generated_ids: list[int] = []
     steps: list[GenerationStep] = []
 
-    # Get EOS token ID for checking
+    # Get EOS token IDs for checking (both <eos> and <end_of_turn>)
     eos_token_id = models.teacher_tokenizer.eos_token_id
+    end_of_turn_id = models.teacher_tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    stop_token_ids = {eos_token_id, end_of_turn_id}
 
     # Sampling params
     teacher_batch_params = cfg.teacher_sampling.to_oai_params(max_tokens=BATCH_SIZE)
     student_params = cfg.student_sampling.to_oai_params()
+
+    def find_first_stop_token(token_ids: list[int]) -> int:
+        """Find index of first stop token, or -1 if none found."""
+        for i, tok_id in enumerate(token_ids):
+            if tok_id in stop_token_ids:
+                return i
+        return -1
 
     while len(steps) < cfg.max_tokens:
         # === Step 1: Teacher generates batch of tokens ===
@@ -456,11 +501,11 @@ async def rsd_decode(
         teacher_token_ids = teacher_output["token_ids"]
         teacher_tokens = teacher_output["tokens"]
 
-        # Check for EOS
-        if eos_token_id in teacher_token_ids:
-            eos_idx = teacher_token_ids.index(eos_token_id)
-            teacher_token_ids = teacher_token_ids[:eos_idx]
-            teacher_tokens = teacher_tokens[:eos_idx]
+        # Check for stop tokens (<eos> or <end_of_turn>)
+        stop_idx = find_first_stop_token(teacher_token_ids)
+        if stop_idx != -1:
+            teacher_token_ids = teacher_token_ids[:stop_idx]
+            teacher_tokens = teacher_tokens[:stop_idx]
             if not teacher_token_ids:
                 break
 
@@ -548,12 +593,12 @@ async def rsd_decode(
         # === Step 4: Add batch steps ===
         steps.extend(batch_steps)
 
-        # Check for EOS in generated tokens
-        if eos_token_id in generated_ids:
-            eos_idx = generated_ids.index(eos_token_id)
-            generated_ids = generated_ids[:eos_idx]
+        # Check for stop tokens in generated tokens
+        stop_idx = find_first_stop_token(generated_ids)
+        if stop_idx != -1:
+            generated_ids = generated_ids[:stop_idx]
             # Also truncate steps
-            steps = steps[:eos_idx]
+            steps = steps[:stop_idx]
             break
 
         if not batch_steps:
@@ -780,20 +825,11 @@ async def async_main(cfg: RSDConfig):
     # Load dataset
     print("\nLoading dataset...")
     dataset = cfg.dataset.load()
-    print(f"Loaded {len(dataset)} examples")
+    print("Loaded dataset (streaming mode)")
 
     # Get completed indices
     completed = get_completed_indices(cfg.output)
     print(f"Already completed: {len(completed)} examples")
-
-    # Determine indices
-    end_idx = cfg.dataset.end_idx if cfg.dataset.end_idx else len(dataset)
-    indices = [
-        i
-        for i in range(cfg.dataset.start_idx, min(end_idx, len(dataset)))
-        if i not in completed
-    ]
-    print(f"To process: {len(indices)} examples")
 
     # Aggregate stats (include previously completed)
     stats = AggregateStats()
@@ -811,75 +847,106 @@ async def async_main(cfg: RSDConfig):
             stats.num_examples += 1
             stats.total_time += r.get("generation_time", 0)
 
-    if not indices:
-        print("Nothing to process!")
-        # Still push if requested and we have data
-        if cfg.push_to_hub and completed:
-            summary = stats.summary()
-            push_to_hub(cfg, summary)
-        return
-
     # Setup clients and tokenizers
     print("\nSetting up model clients and tokenizers...")
     models = setup_clients(cfg)
     print("Ready!\n")
 
     # Process
-    print("Starting RSD generation...\n")
-    for idx in indices:
-        example = dataset[idx]
-        prompt = example["prompt"]
-        response = example.get("response", "")
+    print(f"Starting RSD generation (concurrency={cfg.concurrency})...\n")
 
-        print(f"[{idx}] {prompt[:50]}...")
+    # Semaphore to limit concurrency
+    semaphore = asyncio.Semaphore(cfg.concurrency)
+    # Lock for thread-safe file writes and stats updates
+    write_lock = asyncio.Lock()
 
-        try:
-            start_time = time.time()
-            generated_text, generated_ids, steps = await rsd_decode(
-                models, prompt, cfg, f"ex_{idx}"
-            )
-            gen_time = time.time() - start_time
+    async def process_example(idx: int, example: dict) -> Optional[TraceRecord]:
+        """Process a single example with semaphore-limited concurrency."""
+        async with semaphore:
+            prompt = example["prompt"]
+            response = example.get("response", "")
 
-            # Stats
-            accepted = sum(1 for s in steps if s.accepted)
-            rejected = sum(1 for s in steps if not s.accepted)
-            total = len(steps)
-            acceptance_rate = accepted / total if total > 0 else 0.0
-            avg_surprisal = (
-                sum(s.surprisal for s in steps) / total if total > 0 else 0.0
-            )
+            print(f"[{idx}] Starting: {prompt[:50]}...")
 
-            record = TraceRecord(
-                idx=idx,
-                prompt=prompt,
-                response=response,
-                generated_text=generated_text,
-                generated_token_ids=generated_ids,
-                steps=[asdict(s) for s in steps],
-                total_tokens=total,
-                accepted_tokens=accepted,
-                rejected_tokens=rejected,
-                acceptance_rate=acceptance_rate,
-                avg_surprisal=avg_surprisal,
-                generation_time=gen_time,
-            )
+            try:
+                start_time = time.time()
+                generated_text, generated_ids, steps = await rsd_decode(
+                    models, prompt, cfg, f"ex_{idx}"
+                )
+                gen_time = time.time() - start_time
 
-            append_record(cfg.output, record)
-            stats.update(record)
+                # Stats
+                accepted = sum(1 for s in steps if s.accepted)
+                rejected = sum(1 for s in steps if not s.accepted)
+                total = len(steps)
+                acceptance_rate = accepted / total if total > 0 else 0.0
+                avg_surprisal = (
+                    sum(s.surprisal for s in steps) / total if total > 0 else 0.0
+                )
 
-            print(
-                f"    {total} tokens | "
-                f"Accept: {accepted} ({acceptance_rate * 100:.1f}%) | "
-                f"Reject: {rejected} | "
-                f"Surprisal: {avg_surprisal:.2f} | "
-                f"Time: {gen_time:.1f}s"
-            )
+                record = TraceRecord(
+                    idx=idx,
+                    prompt=prompt,
+                    response=response,
+                    generated_text=generated_text,
+                    generated_token_ids=generated_ids,
+                    steps=[asdict(s) for s in steps],
+                    total_tokens=total,
+                    accepted_tokens=accepted,
+                    rejected_tokens=rejected,
+                    acceptance_rate=acceptance_rate,
+                    avg_surprisal=avg_surprisal,
+                    generation_time=gen_time,
+                )
 
-        except Exception as e:
-            print(f"    Error: {e}")
-            import traceback
+                # Thread-safe write
+                async with write_lock:
+                    append_record(cfg.output, record)
+                    stats.update(record)
 
-            traceback.print_exc()
+                print(
+                    f"[{idx}] Done: {total} tokens | "
+                    f"Accept: {accepted} ({acceptance_rate * 100:.1f}%) | "
+                    f"Reject: {rejected} | "
+                    f"Surprisal: {avg_surprisal:.2f} | "
+                    f"Time: {gen_time:.1f}s"
+                )
+                return record
+
+            except Exception as e:
+                print(f"[{idx}] Error: {e}")
+                import traceback
+
+                traceback.print_exc()
+                return None
+
+    # Collect examples to process
+    examples_to_process = []
+    idx = 0
+    for example in dataset:
+        # Skip to start_idx
+        if idx < cfg.dataset.start_idx:
+            idx += 1
+            continue
+
+        # Stop at end_idx
+        if cfg.dataset.end_idx is not None and idx >= cfg.dataset.end_idx:
+            break
+
+        # Skip already completed
+        if idx in completed:
+            idx += 1
+            continue
+
+        examples_to_process.append((idx, example))
+        idx += 1
+
+    print(f"Collected {len(examples_to_process)} examples to process\n")
+
+    # Process all examples concurrently
+    if examples_to_process:
+        tasks = [process_example(idx, ex) for idx, ex in examples_to_process]
+        await asyncio.gather(*tasks)
 
     # Summary
     print("\n" + "=" * 70)

@@ -1,5 +1,15 @@
-{%- set first_user_prefix = 'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <reasoning> </reasoning> and <answer> </answer> tags, respectively, i.e., <reasoning> reasoning process here </reasoning><answer> answer here </answer>.\n\n' -%}
-{%- set loop_messages = messages -%}
+{{ bos_token }}
+{%- if messages[0]['role'] == 'system' -%}
+    {%- if messages[0]['content'] is string -%}
+        {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}
+    {%- else -%}
+        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}
+    {%- endif -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set first_user_prefix = "" -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
 {%- for message in loop_messages -%}
     {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}
         {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
@@ -26,5 +36,5 @@
     {{ '<end_of_turn>\n' }}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
-    {{'<start_of_turn>model\n<reasoning>\n'}}
+    {{'<start_of_turn>model\n'}}
 {%- endif -%}
